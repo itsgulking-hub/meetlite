@@ -11007,29 +11007,85 @@ function csv() {
 
 // ---------- 6. STUDENT ----------
 function startStudent() {
-  $("codeTxt").textContent = cfg.code; $("shareHint").textContent = "Connecting to class " + cfg.code + "..."; admitted = false; keepAwake(true); $("netFailBtn").hidden = true;
-  peer = newPeer(); let tries = 0, lost = 0;
-  const connectHost = () => {
-    if (!peer || peer.destroyed || ended) return;
+  $("codeTxt").textContent = cfg.code;
+  $("shareHint").textContent = "Connecting to class " + cfg.code + "...";
+  admitted = false; keepAwake(true); $("netFailBtn").hidden = true;
+
+  peer = newPeer();
+  let retryTimer = null, retryDelay = 2500;
+
+  // Keep looking for the teacher automatically. This also handles a student
+  // who opens the link before the teacher has started the room.
+  function scheduleRetry(message) {
+    if (admitted || ended || retryTimer) return;
+    $("shareHint").textContent = message || "Waiting for the teacher... reconnecting automatically.";
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      if (admitted || ended) return;
+      try {
+        if (peer && !peer.destroyed && !peer.open) peer.reconnect();
+      } catch (e) {}
+      connectHost();
+    }, retryDelay);
+    retryDelay = Math.min(10000, Math.round(retryDelay * 1.5));
+  }
+
+  function connectHost() {
+    if (!peer || peer.destroyed || ended || admitted) return;
     try { if (hostConn) hostConn.close(); } catch (e) {}
-    const c = peer.connect(PREFIX + cfg.code, {reliable: true}); hostConn = c;
-    c.on("open", () => { lost = 0; c.send({type: "hello", name: myName, pic: myPic(), uid: myUid()}); });
+    let c;
+    try {
+      c = peer.connect(PREFIX + cfg.code, {reliable: true});
+      hostConn = c;
+    } catch (e) {
+      scheduleRetry("Could not reach the class yet. Trying again automatically...");
+      return;
+    }
+
+    c.on("open", () => {
+      retryDelay = 2500;
+      try { c.send({type: "hello", name: myName, pic: myPic(), uid: myUid()}); }
+      catch (e) { scheduleRetry("Connection interrupted. Reconnecting automatically..."); }
+    });
     c.on("data", onHostMsg);
     c.on("close", () => {
-      if (ended || c !== hostConn) return;
-      if (lost < 6) { lost++; $("shareHint").textContent = "Connection lost. Trying again..."; setTimeout(connectHost, 3000 * Math.min(lost, 3)); }
-      else { ended = true; showEnded("The teacher left the class, or the connection was lost."); }
+      if (ended || admitted || c !== hostConn) return;
+      scheduleRetry("Connection lost. Rejoining the class automatically...");
     });
-    c.on("error", () => { if (!admitted) netFail(netMsg("webrtc")); });
-    try { const pc = c.peerConnection; if (pc) pc.addEventListener("iceconnectionstatechange", () => { if (pc.iceConnectionState === "failed" && !admitted) netFail(netMsg("webrtc")); }); } catch (e) {}
-  };
+    c.on("error", () => {
+      if (!admitted) scheduleRetry("Network connection failed. Retrying automatically...");
+    });
+
+    try {
+      const pc = c.peerConnection;
+      if (pc) pc.addEventListener("iceconnectionstatechange", () => {
+        if (!admitted && (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected")) {
+          scheduleRetry("Your network blocked the direct connection. Trying another connection...");
+        }
+      });
+    } catch (e) {}
+  }
+
   peer.on("open", connectHost);
-  peer.on("disconnected", () => { setTimeout(() => { try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {} }, 1500); });
-  peer.on("error", err => {
-    if (err.type === "peer-unavailable" && tries < 3 && !ended) { tries++; $("shareHint").textContent = "Looking for class " + cfg.code + "... (try " + (tries + 1) + " of 4)"; setTimeout(() => { if (!admitted && !ended) connectHost(); }, 2500); return; }
-    if (admitted) return; netFail(netMsg(err.type));
+  peer.on("disconnected", () => {
+    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
+    scheduleRetry("Reconnecting to the meeting service...");
   });
-  timers.push(setTimeout(() => { if (!admitted && $("shareHint").textContent.indexOf("waiting") < 0 && $("netFailBtn").hidden) netFail("Could not connect to class " + cfg.code + " in 20 seconds. Check the code, ask the teacher to keep the class open, then tap Test my connection."); }, 20000));
+  peer.on("error", err => {
+    if (admitted || ended) return;
+    if (err.type === "peer-unavailable") {
+      scheduleRetry("Waiting for the teacher to start class " + cfg.code + ". This page will join automatically...");
+    } else {
+      scheduleRetry(netMsg(err.type) + " Retrying automatically...");
+    }
+  });
+
+  // Keep the waiting message visible instead of giving up after 20 seconds.
+  timers.push(setTimeout(() => {
+    if (!admitted && !ended) {
+      $("shareHint").textContent = "Still waiting for class " + cfg.code + ". Keep this page open; MeetLite is retrying and will join when the teacher's class is online.";
+    }
+  }, 20000));
 }
 // ---------- student: what the teacher allows ----------
 function setSendVideo(track) {
