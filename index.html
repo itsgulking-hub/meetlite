@@ -10304,6 +10304,7 @@ html[data-theme="dark"] .lnk {
 </div>
 
 <script>
+const CFG = window.MEETLITE_CONFIG || {};   // moved to the top: fixes "Cannot access CFG before initialization" (stuck on loading)
 // ======================================================================
 // MeetLite - script.js
 // ----------------------------------------------------------------------
@@ -11428,7 +11429,7 @@ document.querySelectorAll(".cards .card").forEach(c => {
 // ---------- ACCOUNTS (name + password + profile picture, saved on this device) ----------
 // Accounts live in this browser's localStorage. The password is stored only as a salted PBKDF2 hash.
 // Paste a Google OAuth Client ID here (needs your website domain) to switch on "Continue with Google".
-const CFG = window.MEETLITE_CONFIG || {};                                    // the settings in config.js
+/* CFG is now declared at the top of this script (it was being used before this line, which froze the loading screen) */
 let GOOGLE_CLIENT_ID = String(CFG.googleClientId || "").trim();              // set googleClientId in config.js
 const ACC_KEY = "ml-accounts", SES_KEY = "ml-session";
 const accounts = () => load(ACC_KEY, []);
