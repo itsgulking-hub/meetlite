@@ -60,20 +60,30 @@ window.MEETLITE_CONFIG = {
 
   // The live visitor channel for your Admin panel. Pick any name with letters, numbers
   // and dashes that only you know, for example "gulraiz-live-7421".
-  adminId: "meetlite-live-owner",
+  adminId: "ml-owner-20d07c19053b70e3",
 
   // Optional: locks the live part of the Admin panel to your passcode.
   // Open the Admin panel, create your passcode, and copy the line it shows here.
   ownerHash: "",
 
-  // Helps students on strict mobile networks to join. MeetLite already uses free public relay servers.
-  // To use your own free ones (for example from metered.ca, see DEPLOY.md), fill this in, for example:
-  // turn: {urls: ["turn:a.relay.metered.ca:80", "turn:a.relay.metered.ca:443"], username: "YOUR_USER", credential: "YOUR_PASSWORD"},
+  // Optional TURN credentials for students on restrictive networks.
+  // Paste the credential-scoped ICE URL supplied by your TURN provider here.
+  // Do NOT put an account Secret Key or private server key in this public HTML file.
+  // Example format: https://YOUR_APP.metered.live/api/v1/turn/credentials?apiKey=YOUR_CREDENTIAL_SCOPED_KEY
+  turnCredentialUrl: "",
+
+  // Or provide TURN server entries directly if you already have them.
+  // turn: {urls: ["turn:your-turn-host:443?transport=tcp"], username: "YOUR_USER", credential: "YOUR_PASSWORD"},
   turn: null,
 
   // The free public meeting service can be slow or blocked. To use your own PeerJS server (see DEPLOY.md), for example:
   // peerServer: {host: "your-app.onrender.com", port: 443, path: "/", secure: true, key: "peerjs"}
-  peerServer: null
+  peerServer: null,
+
+  // BEST FIX: a list of your OWN signalling servers (see meetlite-server/README_UR.md).
+  // MeetLite tries them in order, then falls back to the free public service.
+  // Example: peerServers: [{host: "meetlite-signal.onrender.com", port: 443, path: "/", secure: true, key: "peerjs"}]
+  peerServers: []
 };
 
 </script>
@@ -9760,7 +9770,7 @@ html[data-theme="dark"] .lnk {
         <form id="startForm" class="row">
           <input id="title" aria-label="Class title" placeholder="Class title" value="Computer Networks" required>
           <input id="mins" aria-label="Class minutes" type="number" min="1" max="240" value="40" class="short"><span class="muted">min</span>
-          <input id="limit" aria-label="Student limit" type="number" min="1" max="100" value="20" class="short"><span class="muted">students max</span>
+          <input id="limit" aria-label="Student limit" type="number" min="1" max="500" value="20" class="short"><span class="muted">students max</span>
           <input id="myCode" aria-label="Your own class code (optional)" aria-describedby="codeHint" placeholder="Own class code (optional)" maxlength="14" autocomplete="off" autocapitalize="characters" spellcheck="false" class="codein">
           <button class="btn primary" type="submit"><svg class="ic"><use href="#i-video"/></svg>Start meeting</button>
         </form>
@@ -10450,6 +10460,7 @@ const r1 = x => Math.round(x * 10) / 10;
 let role = null, cfg = {title: "", minutes: 40, code: "", limit: 20}, peer = null, hostConn = null, hostCall = null;
 let localStream = null, camTrack = null, camVideo = null, myName = "", sharing = false, eye = null, admitted = false;
 let startedAt = null, offset = 0, ended = false, timers = [], myData = null, materials = [];
+var hostLoopsStarted = false;
 const roster = {}, waiting = {};
 function rulesDefaults() { const r = load("ml-rules", {}); return {mic: !r.mute, cam: !!r.showpics, share: !r.noshare}; }   // cam false = students' pictures are NOT sent to the teacher, only their status   // class rules saved on the Security page
 const bannedNames = new Set(); let hostDefaults = {mic: true, cam: true, share: true};   // teacher controls: who is muted / blocked
@@ -10673,7 +10684,7 @@ document.addEventListener("click", e => { if (e.target.closest("[data-go-home]")
 
 function openLobby(r, o) {
   stopEyeTest(); role = r;
-  cfg = {title: (o.title || "Class").slice(0, 60), minutes: Math.max(1, Math.min(240, parseInt(o.minutes, 10) || 40)), code: o.code ? String(o.code).toUpperCase() : "", limit: Math.max(1, Math.min(100, parseInt(o.limit, 10) || 20)), own: r === "host" && !!o.own, approve: r === "host" && !!load("ml-rules", {}).approve};
+  cfg = {title: (o.title || "Class").slice(0, 60), minutes: Math.max(1, Math.min(240, parseInt(o.minutes, 10) || 40)), code: o.code ? String(o.code).toUpperCase() : "", limit: Math.max(1, Math.min(500, parseInt(o.limit, 10) || 20)), own: r === "host" && !!o.own, approve: r === "host" && !!load("ml-rules", {}).approve};
   if (r === "host" && !cfg.code) cfg.code = newCode();
   $("lobby").hidden = false; $("app").hidden = true; $("ended").hidden = true;
   $("grid").innerHTML = ""; applyLobbyAccount(); $("err").textContent = ""; $("codeTxt").textContent = "------"; $("timer").textContent = "--:--";
@@ -10697,7 +10708,18 @@ $("name").addEventListener("keydown", e => { if (e.key === "Enter") enter(); });
 async function enter() {
   myName = ($("name").value.trim() || (role === "host" ? "Teacher" : "Student")).slice(0, 30);
   if (typeof Peer === "undefined") { $("err").textContent = "The meeting library could not load. Check your internet connection and reload this page."; return; }
-  try { localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true}); }
+  // Fetch the optional, short-scope TURN ICE list before creating PeerJS connections.
+  // If the provider is unavailable, continue with the configured fallback servers.
+  await loadTurnCredentials();
+  $("err").textContent = "Connecting to the meeting service (the first time can take up to 30 seconds)...";
+  await pickServer(); $("err").textContent = "";
+  try {
+    // Capture small and cheap: 480x360 at 15 fps is plenty for class and for the eye check. What goes over the network is capped again below.
+    const want = {audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
+                  video: role === "host" ? {width: {ideal: 640}, height: {ideal: 360}, frameRate: {ideal: 24, max: 30}} : {width: {ideal: 480}, height: {ideal: 360}, frameRate: {ideal: 15, max: 20}}};
+    try { localStream = await navigator.mediaDevices.getUserMedia(want); }
+    catch (e1) { if (e1 && e1.name === "OverconstrainedError") localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true}); else throw e1; }
+  }
   catch (e) { $("err").textContent = "Camera or microphone blocked: " + e.message; return; }
   camTrack = localStream.getVideoTracks()[0];
   chatReset(); ctlState = {mic: true, cam: true, share: true}; bannedNames.clear(); hostDefaults = role === "host" ? rulesDefaults() : {mic: true, cam: true, share: true};
@@ -10714,17 +10736,63 @@ async function enter() {
 // ---------- connection settings (so students on other networks can join) ----------
 // STUN lets two devices find each other. TURN is a free relay used when a strict network (many mobile networks) blocks direct links.
 // You can add your own servers in config.js (turn, peerServer). See DEPLOY.md.
+var runtimeTurnServers = [];
+var turnCredentialStatus = "not-configured";
+async function loadTurnCredentials() {
+  runtimeTurnServers = [];
+  const endpoint = String(CFG.turnCredentialUrl || "").trim();
+  if (!endpoint) { turnCredentialStatus = "not-configured"; return; }
+  try {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeout = setTimeout(() => { try { if (controller) controller.abort(); } catch (e) {} }, 8000);
+    let response;
+    try { response = await fetch(endpoint, {method: "GET", cache: "no-store", mode: "cors", signal: controller ? controller.signal : undefined}); }
+    finally { clearTimeout(timeout); }
+    if (!response || !response.ok) throw new Error("TURN credential request returned " + (response ? response.status : "no response"));
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error("TURN provider returned an unexpected response");
+    runtimeTurnServers = data.filter(x => x && x.urls && /^turns?:/i.test(Array.isArray(x.urls) ? x.urls.join(" ") : String(x.urls)) && x.username && x.credential);
+    if (!runtimeTurnServers.length) throw new Error("No usable TURN entries were returned");
+    turnCredentialStatus = "ready";
+  } catch (e) {
+    runtimeTurnServers = [];
+    turnCredentialStatus = "failed";
+    console.warn("MeetLite TURN credentials could not be loaded:", e && e.message ? e.message : e);
+  }
+}
 function iceServers() {
   const list = [
-    {urls: "stun:stun.l.google.com:19302"}, {urls: "stun:stun1.l.google.com:19302"}, {urls: "stun:stun.cloudflare.com:3478"},
+    {urls: "stun:stun.l.google.com:19302"},
+    {urls: "stun:stun1.l.google.com:19302"},
+    {urls: "stun:stun.cloudflare.com:3478"},
+    // Public TURN entries are best-effort fallbacks; a configured TURN credential is preferred.
     {urls: ["turn:eu-0.turn.peerjs.com:3478", "turn:us-0.turn.peerjs.com:3478"], username: "peerjs", credential: "peerjsp"},
     {urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:443?transport=tcp"], username: "openrelayproject", credential: "openrelayproject"}
   ];
+  runtimeTurnServers.forEach(x => list.unshift(x));
   const t = CFG.turn; if (t) (Array.isArray(t) ? t : [t]).forEach(x => { if (x && x.urls) list.unshift({urls: x.urls, username: x.username || "", credential: x.credential || ""}); });
   return list;
 }
+var psList = (function () {
+  const l = [], add = x => { if (x && x.host && !l.some(y => y.host === x.host)) l.push(x); };
+  if (Array.isArray(CFG.peerServers)) CFG.peerServers.forEach(add); add(CFG.peerServer);
+  l.push(null);                                                  // null = the free public PeerJS service (last resort)
+  return l;
+})();
+var psIndex = 0;
+function tryServer(i, ms) {                                      // can we reach signalling server number i?
+  return new Promise(res => {
+    let done = false, p; const fin = v => { if (done) return; done = true; clearTimeout(t); try { p.destroy(); } catch (e) {} res(v); }, t = setTimeout(() => fin(false), ms);
+    psIndex = i;
+    try { p = newPeer(); p.on("open", () => fin(true)); p.on("error", () => fin(false)); } catch (e) { fin(false); }
+  });
+}
+async function pickServer() {                                    // first reachable server wins (a sleeping free server can take ~30 s to wake up)
+  for (let i = 0; i < psList.length; i++) { if (await tryServer(i, psList[i] ? 30000 : 8000)) { psIndex = i; return true; } }
+  psIndex = 0; return false;
+}
 function peerOpts() {
-  const o = {debug: 0, config: {iceServers: iceServers(), iceCandidatePoolSize: 4}}, ps = CFG.peerServer;
+  const o = {debug: 0, config: {iceServers: iceServers(), iceCandidatePoolSize: 4}}, ps = psList[psIndex % psList.length];
   if (ps && ps.host) Object.assign(o, {host: ps.host, port: ps.port || 443, path: ps.path || "/", secure: ps.secure !== false, key: ps.key || "peerjs"});
   return o;
 }
@@ -10742,18 +10810,78 @@ var wake = null;
 async function keepAwake(on) { try { if (on && navigator.wakeLock && !wake) { wake = await navigator.wakeLock.request("screen"); wake.addEventListener("release", () => { wake = null; }); } else if (!on && wake) { await wake.release(); wake = null; } } catch (e) { wake = null; } }
 document.addEventListener("visibilitychange", () => { if (!document.hidden && role) keepAwake(true); });
 
+// ---------- low-network control: cap what goes over the network ----------
+function capCall(call, kbps, scale, fps, audioKbps) {
+  try {
+    const pc = call && call.peerConnection; if (!pc) return;
+    pc.getTransceivers().forEach(t => {
+      if (!t.sender || !t.receiver || !t.receiver.track) return;
+      const p = t.sender.getParameters(); if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      if (t.receiver.track.kind === "video") { p.encodings[0].maxBitrate = Math.round(kbps * 1000); p.encodings[0].maxFramerate = fps; p.encodings[0].scaleResolutionDownBy = Math.max(1, scale); }
+      else p.encodings[0].maxBitrate = (audioKbps || 24) * 1000;
+      const r = t.sender.setParameters(p); if (r && r.catch) r.catch(() => {});
+    });
+  } catch (e) {}
+}
+var lastStudentKbps = 0;
+function tuneHostNet() {                                         // the more students, the less each video may use
+  if (role !== "host" || ended) return;
+  const live = Object.values(roster).filter(r => r.call && !r.offline && !r.banned), n = Math.max(1, live.length);
+  const kbps = Math.round(Math.max(40, Math.min(450, 1200 / n))), fps = n > 12 ? 12 : n > 6 ? 15 : 20, scale = (typeof sharing !== "undefined" && sharing) ? 1 : (n > 16 ? 2 : 1);
+  live.forEach(r => capCall(r.call, kbps, scale, fps, 24));
+  const sk = Math.round(Math.max(20, Math.min(150, 2400 / n)));   // what each student may send to the teacher
+  if (Math.abs(sk - lastStudentKbps) >= 10) { lastStudentKbps = sk; live.forEach(r => { try { if (r.conn && r.conn.open) r.conn.send({type: "net", kbps: sk}); } catch (e) {} }); }
+}
+function studentNet(m) { const k = Math.max(15, Math.min(300, +m.kbps || 100)); if (hostCall) capCall(hostCall, k, 2, k < 50 ? 8 : 15, 20); studentNetKbps = k; }
+var studentNetKbps = 100;
+
 // ---------- 5. TEACHER (host) ----------
 function startHost(tries) {
   if (!cfg.code) cfg.code = newCode();
   $("shareHint").textContent = "Connecting...";
   peer = newPeer(PREFIX + cfg.code); keepAwake(true); $("netFailBtn").hidden = true;
-  peer.on("disconnected", () => { $("shareHint").textContent = "Reconnecting to the meeting service..."; setTimeout(() => { try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {} }, 1500); });
+  let restartTimer = null, reconnectWatchdog = null, classWasOpened = false;
+  function retryHost(message) {
+    if (ended || role !== "host") return;
+    $("shareHint").textContent = message || "Meeting service interrupted. Reconnecting automatically...";
+    // Never destroy an already-running room automatically: doing so would drop
+    // every connected student. Once the room is open, ask PeerJS to restore its
+    // signalling socket and keep the existing room identity intact.
+    if (classWasOpened) {
+      try { if (peer && !peer.destroyed && peer.disconnected) peer.reconnect(); } catch (e) {}
+      return;
+    }
+    if (restartTimer) return;
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      if (ended || role !== "host") return;
+      try { if (peer && !peer.destroyed) peer.destroy(); } catch (e) {}
+      peer = null;
+      if (!classWasOpened && psList.length > 1) psIndex = (psIndex + 1) % psList.length;       // this server did not work: try the next one
+      startHost(tries);
+    }, 5000);
+  }
+  peer.on("disconnected", () => {
+    $("shareHint").textContent = "Reconnecting to the meeting service...";
+    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
+    clearTimeout(reconnectWatchdog);
+    reconnectWatchdog = setTimeout(() => {
+      if (peer && !peer.destroyed && peer.disconnected) retryHost("Meeting service did not reconnect. Restarting the class connection...");
+    }, 9000);
+  });
   peer.on("open", () => {
-    startedAt = Date.now(); offset = 0; ended = false;
+    classWasOpened = true;
+    clearTimeout(reconnectWatchdog);
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    startedAt = startedAt || Date.now(); offset = 0; ended = false;
     if (cfg.own) { save("ml-mycode", cfg.code); showLastCode(); }
     $("codeTxt").textContent = cfg.code;
     $("shareHint").textContent = "Share the code " + cfg.code + " with your students (WhatsApp button below). Keep this page open and the phone screen on during the class.";
-    timers.push(setInterval(tick, 1000), setInterval(renderRoster, 2000), setInterval(saveHistory, 10000)); tick(); renderRoster(); saveHistory();
+    if (!hostLoopsStarted) {
+      hostLoopsStarted = true;
+      timers.push(setInterval(tick, 1000), setInterval(renderRoster, 2000), setInterval(saveHistory, 10000), setInterval(tuneHostNet, 4000));
+    }
+    tick(); renderRoster(); saveHistory();
   });
   peer.on("connection", onStudentData);
   peer.on("call", onStudentCall);
@@ -10763,6 +10891,9 @@ function startHost(tries) {
       $("myCode").value = taken; codeHint("The code " + taken + " is already used by a class that is running right now. Choose a different code, or leave it empty.", true); $("myCode").focus();
     }
     else if (err.type === "unavailable-id" && tries < 4) { cfg.code = newCode(); try { peer.destroy(); } catch (e) {} startHost(tries + 1); }
+    else if (/^(network|server-error|socket-error|socket-closed|disconnected)$/.test(err.type || "")) {
+      retryHost(netMsg(err.type) + " Retrying automatically...");
+    }
     else netFail(netMsg(err.type));
   });
 }
@@ -11010,80 +11141,85 @@ function startStudent() {
   $("codeTxt").textContent = cfg.code;
   $("shareHint").textContent = "Connecting to class " + cfg.code + "...";
   admitted = false; keepAwake(true); $("netFailBtn").hidden = true;
-
   peer = newPeer();
-  let retryTimer = null, retryDelay = 2500;
+  let retryTimer = null, retryDelay = 2500, attempt = 0, peerReady = false;
 
-  // Keep looking for the teacher automatically. This also handles a student
-  // who opens the link before the teacher has started the room.
   function scheduleRetry(message) {
     if (admitted || ended || retryTimer) return;
-    $("shareHint").textContent = message || "Waiting for the teacher... reconnecting automatically.";
+    $("shareHint").textContent = message || "Waiting for the teacher. MeetLite will keep trying automatically...";
     retryTimer = setTimeout(() => {
       retryTimer = null;
       if (admitted || ended) return;
-      try {
-        if (peer && !peer.destroyed && !peer.open) peer.reconnect();
-      } catch (e) {}
-      connectHost();
+      attempt++;
+      if (peer && !peer.destroyed && !peer.open) {
+        try { peer.reconnect(); } catch (e) {}
+      }
+      if (peer && peer.open) connectHost();
+      else if (!peer || peer.destroyed) {
+        try { peer = newPeer(); bindPeerEvents(); } catch (e) { scheduleRetry("Meeting service reconnecting..."); }
+      }
     }, retryDelay);
-    retryDelay = Math.min(10000, Math.round(retryDelay * 1.5));
+    retryDelay = Math.min(15000, Math.round(retryDelay * 1.5));
   }
 
   function connectHost() {
-    if (!peer || peer.destroyed || ended || admitted) return;
+    if (!peer || peer.destroyed || ended || admitted || !peer.open) return;
     try { if (hostConn) hostConn.close(); } catch (e) {}
     let c;
-    try {
-      c = peer.connect(PREFIX + cfg.code, {reliable: true});
-      hostConn = c;
-    } catch (e) {
-      scheduleRetry("Could not reach the class yet. Trying again automatically...");
-      return;
-    }
-
+    try { c = peer.connect(PREFIX + cfg.code, {reliable: true}); hostConn = c; }
+    catch (e) { scheduleRetry("Could not reach the class yet. Retrying automatically..."); return; }
     c.on("open", () => {
-      retryDelay = 2500;
+      attempt = 0; retryDelay = 2500;
       try { c.send({type: "hello", name: myName, pic: myPic(), uid: myUid()}); }
-      catch (e) { scheduleRetry("Connection interrupted. Reconnecting automatically..."); }
+      catch (e) { scheduleRetry("Connection interrupted. Rejoining automatically..."); }
     });
     c.on("data", onHostMsg);
     c.on("close", () => {
       if (ended || admitted || c !== hostConn) return;
-      scheduleRetry("Connection lost. Rejoining the class automatically...");
+      scheduleRetry("Connection closed before joining. Looking for the class again...");
     });
     c.on("error", () => {
       if (!admitted) scheduleRetry("Network connection failed. Retrying automatically...");
     });
-
     try {
       const pc = c.peerConnection;
       if (pc) pc.addEventListener("iceconnectionstatechange", () => {
         if (!admitted && (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected")) {
-          scheduleRetry("Your network blocked the direct connection. Trying another connection...");
+          scheduleRetry("This network could not complete the direct connection. Trying again...");
         }
       });
     } catch (e) {}
   }
 
-  peer.on("open", connectHost);
-  peer.on("disconnected", () => {
-    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
-    scheduleRetry("Reconnecting to the meeting service...");
-  });
-  peer.on("error", err => {
-    if (admitted || ended) return;
-    if (err.type === "peer-unavailable") {
-      scheduleRetry("Waiting for the teacher to start class " + cfg.code + ". This page will join automatically...");
-    } else {
-      scheduleRetry(netMsg(err.type) + " Retrying automatically...");
-    }
-  });
+  function bindPeerEvents() {
+    if (!peer || peer.destroyed) return;
+    peer.on("open", () => { peerReady = true; retryDelay = 2500; connectHost(); });
+    peer.on("disconnected", () => {
+      peerReady = false;
+      try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
+      scheduleRetry("Reconnecting to the meeting service...");
+    });
+    peer.on("error", err => {
+      if (admitted || ended) return;
+      if (err && err.type === "peer-unavailable") {
+        if (psList.length > 1) { try { peer.destroy(); } catch (e) {} psIndex = (psIndex + 1) % psList.length; try { peer = newPeer(); bindPeerEvents(); } catch (e) {} }   // the teacher may be on another server
+        scheduleRetry("Waiting for the teacher to start class " + cfg.code + ". This page will join automatically...");
+      } else {
+        scheduleRetry(netMsg(err && err.type) + " Retrying automatically...");
+      }
+    });
+  }
 
-  // Keep the waiting message visible instead of giving up after 20 seconds.
+  bindPeerEvents();
+  // If the teacher starts later, keep checking until the student joins or leaves.
+  timers.push(setInterval(() => {
+    if (admitted || ended || retryTimer) return;
+    if (peer && peer.open && (!hostConn || !hostConn.open)) connectHost();
+    else if (!peer || peer.destroyed || !peer.open) scheduleRetry("Waiting for the meeting service. Reconnecting automatically...");
+  }, 12000));
   timers.push(setTimeout(() => {
     if (!admitted && !ended) {
-      $("shareHint").textContent = "Still waiting for class " + cfg.code + ". Keep this page open; MeetLite is retrying and will join when the teacher's class is online.";
+      $("shareHint").textContent = "Still waiting for class " + cfg.code + ". Keep this page open; MeetLite is retrying automatically.";
     }
   }, 20000));
 }
@@ -11113,6 +11249,7 @@ function onHostMsg(m) {
     $("shareHint").textContent = "You are in. Your picture is not shared: the teacher sees only your status, unless they turn your camera on. The eye check runs on your own device and sends only one word: Awake, Drowsy, Asleep or Away.";
     hostCall = peer.call(PREFIX + cfg.code, localStream, {metadata: {name: myName}});
     hostCall.on("stream", s => addTile("host", "Teacher", s, false));
+    setTimeout(() => capCall(hostCall, studentNetKbps, 2, 15, 20), 1500); setTimeout(() => capCall(hostCall, studentNetKbps, 2, 15, 20), 6000);
     setTimeout(() => applyCtl(false), 1500);
     eye = makeEye(); paintEye(eye, {badge: "myBadge", ear: "myEar", tl: "myTl", mins: "myMins"});
     timers.push(setInterval(tick, 1000), setInterval(sendStatus, 3000)); tick(); startEyeCheck();
@@ -11133,6 +11270,7 @@ function onHostMsg(m) {
     myData = m;
     $("myLine").textContent = "In class: " + m.attended_min + " min of " + cfg.minutes + ". Awake " + m.awake_min + " min. The teacher sees: " + m.state + ".";
   } else if (m.type === "material" && typeof m.img === "string" && /^data:image\/jpeg;base64,/.test(m.img)) { materials.push({id: String(m.id), name: String(m.name).slice(0, 40), img: m.img}); renderMaterials(); }
+  else if (m.type === "net") studentNet(m);
   else if (m.type === "test") studentGetTest(m);
   else if (m.type === "lec") lecStart(m);
   else if (m.type === "lecc") lecChunk(m);
@@ -11181,7 +11319,7 @@ function leaveRoom() {
   try { peer && peer.destroy(); } catch (e) {} peer = null; hostConn = null; hostCall = null;
   if (localStream) localStream.getTracks().forEach(t => t.stop()); localStream = null; camTrack = null; camVideo = null;
   dockReset(); chatReset(); activeTest = null; Object.keys(roster).forEach(k => delete roster[k]); Object.keys(waiting).forEach(k => delete waiting[k]); renderWaiting();
-  startedAt = null; offset = 0; ended = false; sharing = false; role = null; eye = null; admitted = false;
+  startedAt = null; offset = 0; ended = false; sharing = false; role = null; eye = null; admitted = false; hostLoopsStarted = false;
   history.replaceState(null, "", location.pathname + location.search);
   document.title = "MeetLite"; show("home"); goView("dashboard"); showLastCode();
 }
@@ -11250,7 +11388,7 @@ function log(msg) {
   const d = document.createElement("div"); d.textContent = new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) + "  " + msg;
   a.prepend(d); while (a.children.length > 8) a.lastChild.remove(); toast(msg);
 }
-$("bLimit").addEventListener("click", () => { cfg.limit = Math.min(100, cfg.limit + 5); renderRoster(); log("Limit raised to " + cfg.limit); });
+$("bLimit").addEventListener("click", () => { cfg.limit = Math.min(500, cfg.limit + 5); renderRoster(); log("Limit raised to " + cfg.limit); });
 
 // ---------- 10. SHARE ON WHATSAPP (simple words) ----------
 function shareMessage() {
@@ -12781,7 +12919,7 @@ function admSetup(el) {
     '<details><summary>Lock the live panel to your passcode (Owner lock)</summary><ol><li>This panel already made your passcode. The long text in the Owner lock box above is its fingerprint.</li><li>Put it in config.js (the box above makes the right line), Commit, refresh.</li><li>From then on only your passcode opens the live view. Use a long passcode.</li></ol></details>' +
     '<details><summary>Show up on Google, and use a .app address</summary><ol><li>Open <b>search.google.com/search-console</b>, add your site address, and follow the steps to confirm it (the HTML file method works on GitHub).</li><li>In Search Console open <b>Sitemaps</b> and add <b>sitemap.xml</b>. Google then finds MeetLite. New sites usually take a few days to a few weeks to appear.</li><li>For a name like <b>meetlite.app</b>: buy it from a domain seller (Namecheap, Porkbun), then in your GitHub repository open <b>Settings, Pages, Custom domain</b>, type the name and turn on <b>Enforce HTTPS</b>. At the seller add the records GitHub shows. A .app name works only with HTTPS, which GitHub gives you.</li><li>After the new address works, put it in siteUrl in config.js, in robots.txt, in sitemap.xml and in the canonical line of index.html.</li></ol></details>' +
     '</div>';
-  const gen = () => { const v = id => String(($(id) || {}).value || "").trim().replace(/["\\]/g, ""); const t = '/* MeetLite settings. Edit on GitHub. Nothing here is secret. */\nwindow.MEETLITE_CONFIG = {\n  siteUrl: "' + v("cgSite") + '",\n  googleClientId: "' + v("cgGoogle") + '",\n  goatcounter: "' + v("cgGoat") + '",\n  adminId: "' + v("cgAdmin") + '",\n  ownerHash: "' + v("cgOwner") + '",\n  turn: ' + JSON.stringify(CFG.turn || null) + ',\n  peerServer: ' + JSON.stringify(CFG.peerServer || null) + '\n};\n'; $("cgOut").value = t; };
+  const gen = () => { const v = id => String(($(id) || {}).value || "").trim().replace(/["\\]/g, ""); const t = '/* MeetLite settings. Edit on GitHub. Nothing here is secret. */\nwindow.MEETLITE_CONFIG = {\n  siteUrl: "' + v("cgSite") + '",\n  googleClientId: "' + v("cgGoogle") + '",\n  goatcounter: "' + v("cgGoat") + '",\n  adminId: "' + v("cgAdmin") + '",\n  ownerHash: "' + v("cgOwner") + '",\n  turn: ' + JSON.stringify(CFG.turn || null) + ',\n  peerServer: ' + JSON.stringify(CFG.peerServer || null) + ',\n  peerServers: ' + JSON.stringify(CFG.peerServers || []) + ',\n  turnCredentialUrl: ' + JSON.stringify(CFG.turnCredentialUrl || "") + '\n};\n'; $("cgOut").value = t; };
   ["cgSite", "cgGoogle", "cgGoat", "cgAdmin"].forEach(i => $(i).addEventListener("input", gen)); gen();
   $("cgCopy").addEventListener("click", () => { copyText($("cgOut").value); roomToast("config.js text copied."); }); $("cgShare").addEventListener("click", shareApp);
 }
@@ -12887,22 +13025,21 @@ function gatherTypes(servers, relayOnly) {
     pc.createOffer().then(o => pc.setLocalDescription(o)).catch(finish); setTimeout(finish, 9000);
   });
 }
-function serviceReachable() {
-  return new Promise(res => {
-    if (typeof Peer === "undefined") return res(false); let done = false, p; const fin = v => { if (done) return; done = true; clearTimeout(t); try { p.destroy(); } catch (e) {} res(v); }, t = setTimeout(() => fin(false), 9000);
-    try { p = newPeer(); p.on("open", () => fin(true)); p.on("error", () => fin(false)); } catch (e) { fin(false); }
-  });
+async function serviceReachable() {
+  if (typeof Peer === "undefined") return false;
+  for (let i = 0; i < psList.length; i++) { if (await tryServer(i, psList[i] ? 25000 : 9000)) { psIndex = i; return true; } }
+  return false;
 }
 async function netTest() {
   const out = $("netOut"), rows = []; $("netModal").hidden = false; document.body.style.overflow = "hidden"; $("netRun").disabled = true;
   const draw = pending => { out.innerHTML = rows.map(r => '<div class="nrow ' + (r.ok ? "ok" : "no") + '"><i>' + (r.ok ? "&#10003;" : "!") + '</i><div><b>' + r.t + '</b><small>' + r.d + '</small></div></div>').join("") + (pending ? '<p class="muted small" style="margin:10px 0 0">Testing: ' + pending + '...</p>' : ""); };
   const mobile = matchMedia("(max-width:860px)").matches; rows.push({ok: isSecureContext, t: "Secure page (https)", d: isSecureContext ? "Camera and microphone are allowed on this page." : "This page is not https, so the camera will be blocked. Open the https address."}); draw("internet");
   rows.push({ok: navigator.onLine, t: "Internet", d: navigator.onLine ? "This " + (mobile ? "phone" : "computer") + " is online." : "No internet connection."}); draw("meeting service");
-  const svc = await serviceReachable(); rows.push({ok: svc, t: "Meeting service", d: svc ? "Reachable. Teachers and students can find each other." : "Not reachable. Your network or the free meeting service is blocking it. Try another network (Wi-Fi or mobile data) or a VPN, and try again later."}); draw("direct connection");
+  const svc = await serviceReachable(); rows.push({ok: svc, t: "Meeting service", d: svc ? "Reachable (" + (psList[psIndex] ? "your own server" : "free public server") + "). Teachers and students can find each other." : (psList.length < 2 ? "Not reachable. The free public service is blocked on this network. The owner must add their own server (peerServers in the settings). Meanwhile try another network or a VPN." : "Not reachable. None of the servers answered. If your own server was asleep, wait 30 seconds and tap Test again.")}); draw("direct connection");
   const stun = await gatherTypes(iceServers().filter(x => String(x.urls).indexOf("stun") === 0), false), direct = stun.has("srflx");
   rows.push({ok: direct, t: "Direct connection (STUN)", d: direct ? "Your network lets other devices find yours." : "Could not find a public address for this device. Direct connections may fail on this network."}); draw("relay for strict networks");
   const turn = await gatherTypes(iceServers().filter(x => String(x.urls).indexOf("turn") === 0), true), relay = turn.has("relay");
-  rows.push({ok: relay, t: "Relay (TURN)", d: relay ? "Available. Even strict mobile networks can join." : "No relay answered. People on strict mobile networks may not be able to join. The owner can add a free relay in config.js (see DEPLOY.md)."});
+  rows.push({ok: relay, t: "Relay (TURN)", d: relay ? "Available. Even strict mobile networks can join." : (turnCredentialStatus === "failed" ? "The configured TURN credential service could not be reached or returned invalid credentials. Check the credential URL and provider status." : "No TURN relay answered. Some mobile or restricted networks may fail. Add a valid TURN credential URL in the existing MEETLITE_CONFIG to enable relay fallback.")});
   const good = svc && (direct || relay); rows.push({ok: good, t: good ? "Result: this device can join live classes" : "Result: joining may fail on this device or network", d: good ? (relay ? "Everything works." : "Works on most networks. Run this test on the other device too.") : "Try Wi-Fi instead of mobile data (or the other way round), turn off any VPN, and keep the teacher's page open. Run this test on both devices."});
   draw(""); $("netRun").disabled = false;
 }
